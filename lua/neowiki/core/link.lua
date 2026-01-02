@@ -4,6 +4,72 @@ local state = require("neowiki.state")
 
 local M = {}
 
+-- TOGGLE: Set to false to disable Treesitter and force Regex fallback (for testing)
+local USE_TREESITTER = false
+
+-- CONSTANTS: Regex Patterns
+-- 1. Wikilink: [[target]]
+-- Matches [[target]]. Uses non-greedy (.-) to handle multiple links on one line.
+local PATTERN_WIKI = "%[%[(.-)%]%]"
+
+-- 2. Markdown Link (Balanced): [text](target) OR ![text](target)
+-- Capture 1: Display text (bracketed, with optional leading !)
+-- Capture 2: The balanced parens (target wrapper)
+-- Improvement: Uses %b() to correctly handle nested parens in paths (e.g. file(1).md)
+local PATTERN_MD_BALANCED = "(!?%[[^%]]*%])(%b())"
+
+-- 3. Markdown Link (Angle Brackets): [text](<target>)
+-- Capture 1: Display text
+-- Capture 2: Target inside <...>
+local PATTERN_MD_ANGLE = "(!?%[[^%]]*%])%(<(.-)>%)"
+
+---
+-- Helper to check if a node type is a valid markdown link container
+local function is_link_node(node_type)
+  return node_type == "inline_link"
+    or node_type == "full_reference_link"
+    or node_type == "shortcut_link"
+    or node_type == "image"
+end
+
+---
+-- Uses Treesitter to extract link target under cursor.
+-- Returns nil if TS is unavailable, disabled, or no link is found.
+local function get_ts_link_target()
+  if not USE_TREESITTER then
+    return nil
+  end
+
+  local ok, ts_utils = pcall(require, "nvim-treesitter.ts_utils")
+  if not ok then
+    return nil
+  end
+
+  local node = ts_utils.get_node_at_cursor()
+  if not node then
+    return nil
+  end
+
+  local expr = node
+  while expr do
+    local ntype = expr:type()
+    -- Safety: Ignore links inside code blocks
+    if ntype == "code_span" or ntype == "fenced_code_block" or ntype == "code_block" then
+      return nil
+    end
+
+    if is_link_node(ntype) then
+      for child in expr:iter_children() do
+        if child:type() == "link_destination" then
+          return vim.treesitter.get_node_text(child, 0)
+        end
+      end
+    end
+    expr = expr:parent()
+  end
+  return nil
+end
+
 ---
 -- A generic function that iterates through all links on a line and applies
 -- a transformation based on the provided logic.
@@ -25,26 +91,30 @@ local function generic_link_transformer(line, transform_logic)
     end
   end
 
-  -- 1. Handle standard markdown links: [text](target)
-  line = line:gsub("(%[[^%]]*%])%(<(.-)>%)", function(link_text_part, raw_target)
+  -- 1. Handle angle bracket links: [text](<target>)
+  line = line:gsub(PATTERN_MD_ANGLE, function(link_text_part, raw_target)
     return replacer({
       type = "markdown",
-      display_text = link_text_part:match("^%[(.*)%]$"),
+      display_text = link_text_part:match("^!?%[(.*)%]$"),
       raw_target = raw_target,
       full_markup = link_text_part .. "(<" .. raw_target .. ">)",
     })
   end)
-  line = line:gsub("(%[[^%]]*%])%(([^)]*)%)", function(link_text_part, raw_target)
+
+  -- 2. Handle standard/balanced links: [text](target)
+  line = line:gsub(PATTERN_MD_BALANCED, function(link_text_part, target_parens)
+    -- Strip the surrounding parentheses from %b() capture
+    local raw_target = target_parens:sub(2, -2)
     return replacer({
       type = "markdown",
-      display_text = link_text_part:match("^%[(.*)%]$"),
+      display_text = link_text_part:match("^!?%[(.*)%]$"),
       raw_target = raw_target,
-      full_markup = link_text_part .. "(" .. raw_target .. ")",
+      full_markup = link_text_part .. target_parens,
     })
   end)
 
-  -- 2. Handle wikilinks: [[target]]
-  line = line:gsub("%[%[([^%]]+)%]%]", function(raw_target)
+  -- 3. Handle wikilinks: [[target]]
+  line = line:gsub(PATTERN_WIKI, function(raw_target)
     return replacer({
       type = "wikilink",
       display_text = raw_target,
@@ -130,53 +200,124 @@ end
 -- @param pattern_to_match string|nil The substring to search for in link targets ("hungry mode"), or nil to use cursor position.
 -- @return string|nil The processed link target if a match is found, otherwise nil.
 M.process_link = function(cursor, line, pattern_to_match)
-  -- Determine the mode. If pattern_to_match is nil, use cursor position.
-  local hungry_mode = pattern_to_match ~= nil
-  local col = not hungry_mode and (cursor[2] + 1) or 0
-
-  -- 1. Search for standard markdown links: [text](target)
-  do
-    local md_pattern = "%[(.-)%]%(<?([^)>]+)>?%)"
+  -- 1. Hungry Mode (Search by pattern)
+  -- Used for rename/delete operations to find specific targets on a line.
+  if pattern_to_match then
+    -- Standard/Balanced Markdown links
     local search_pos = 1
     while true do
-      local s, e, _, target = line:find(md_pattern, search_pos)
+      local s, e, _, target_parens = line:find(PATTERN_MD_BALANCED, search_pos)
       if not s then
         break
       end
       search_pos = e + 1
+      local target = target_parens:sub(2, -2)
+      if target and target:find(pattern_to_match, 1, true) then
+        return util.process_link_target(target, state.markdown_extension)
+      end
+    end
 
-      if hungry_mode then
-        if target and target:find(pattern_to_match, 1, true) then
-          return util.process_link_target(target, state.markdown_extension)
-        end
-      elseif col >= s and col <= e then
+    -- Angle Bracket Markdown links
+    search_pos = 1
+    while true do
+      local s, e, _, target = line:find(PATTERN_MD_ANGLE, search_pos)
+      if not s then
+        break
+      end
+      search_pos = e + 1
+      if target and target:find(pattern_to_match, 1, true) then
+        return util.process_link_target(target, state.markdown_extension)
+      end
+    end
+
+    -- Wikilinks
+    search_pos = 1
+    while true do
+      local s, e, target = line:find(PATTERN_WIKI, search_pos)
+      if not s then
+        break
+      end
+      search_pos = e + 1
+      if target and target:find(pattern_to_match, 1, true) then
+        return util.process_link_target(target, state.markdown_extension)
+      end
+    end
+    return nil
+  end
+
+  -- 2. Cursor Mode
+
+  -- A. Try Treesitter (Best for context awareness)
+  local ts_target = get_ts_link_target()
+  if ts_target then
+    return util.process_link_target(ts_target, state.markdown_extension)
+  end
+
+  -- B. Treesitter Safety Check (Block Detection)
+  -- Uses `ignore_injections = true` to check the HOST (Markdown) tree.
+  -- This ensures we detect code blocks even if the language inside is injected (e.g., Python).
+  if USE_TREESITTER and vim.treesitter and vim.treesitter.get_node then
+    local node = vim.treesitter.get_node({ ignore_injections = true })
+    while node do
+      local ntype = node:type()
+      if
+        ntype == "code_span"
+        or ntype == "fenced_code_block"
+        or ntype == "code_block"
+        or ntype == "block_quote"
+      then
+        return nil -- Cursor is in a "safe" block; do not process regex.
+      end
+      node = node:parent()
+    end
+  end
+
+  local col = cursor[2] + 1
+
+  -- C. Regex Fallback
+  -- (Prioritize Wikilinks since standard links are likely handled by TS)
+
+  -- Wikilinks
+  do
+    local search_pos = 1
+    while true do
+      local s, e, target = line:find(PATTERN_WIKI, search_pos)
+      if not s then
+        break
+      end
+      search_pos = e + 1
+      if col >= s and col <= e then
         return util.process_link_target(target, state.markdown_extension)
       end
     end
   end
 
-  -- 2. If no markdown link was found/matched, search for wikilinks: [[target]]
+  -- Standard/Balanced Markdown links
   do
-    local wiki_pattern = "%[%[(.-)%]%]"
     local search_pos = 1
     while true do
-      local s, e, target = line:find(wiki_pattern, search_pos)
+      local s, e, _, target_parens = line:find(PATTERN_MD_BALANCED, search_pos)
       if not s then
         break
       end
       search_pos = e + 1
+      if col >= s and col <= e then
+        local target = target_parens:sub(2, -2)
+        return util.process_link_target(target, state.markdown_extension)
+      end
+    end
+  end
 
-      if hungry_mode then
-        if target and target:find(pattern_to_match, 1, true) then
-          vim.notify(
-            "hungry_mode taget found for [[]] pattern: "
-              .. target
-              .. " pattern: "
-              .. pattern_to_match
-          )
-          return util.process_link_target(target, state.markdown_extension)
-        end
-      elseif col >= s and col <= e then
+  -- Angle Bracket Markdown links
+  do
+    local search_pos = 1
+    while true do
+      local s, e, _, target = line:find(PATTERN_MD_ANGLE, search_pos)
+      if not s then
+        break
+      end
+      search_pos = e + 1
+      if col >= s and col <= e then
         return util.process_link_target(target, state.markdown_extension)
       end
     end

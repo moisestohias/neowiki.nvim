@@ -5,7 +5,7 @@ local state = require("neowiki.state")
 local M = {}
 
 -- TOGGLE: Set to false to disable Treesitter and force Regex fallback (for testing)
-local USE_TREESITTER = false
+local USE_TREESITTER = true
 
 -- CONSTANTS: Regex Patterns
 -- 1. Wikilink: [[target]]

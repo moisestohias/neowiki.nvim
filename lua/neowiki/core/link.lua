@@ -4,27 +4,18 @@ local state = require("neowiki.state")
 
 local M = {}
 
--- TOGGLE: Set to false to disable Treesitter and force Regex fallback (for testing)
 local USE_TREESITTER = true
-
--- CONSTANTS: Regex Patterns
+-- Regex Patterns
 -- 1. Wikilink: [[target]]
--- Matches [[target]]. Uses non-greedy (.-) to handle multiple links on one line.
 local PATTERN_WIKI = "%[%[(.-)%]%]"
-
 -- 2. Markdown Link (Balanced): [text](target) OR ![text](target)
--- Capture 1: Display text (bracketed, with optional leading !)
--- Capture 2: The balanced parens (target wrapper)
--- Improvement: Uses %b() to correctly handle nested parens in paths (e.g. file(1).md)
 local PATTERN_MD_BALANCED = "(!?%[[^%]]*%])(%b())"
-
 -- 3. Markdown Link (Angle Brackets): [text](<target>)
--- Capture 1: Display text
--- Capture 2: Target inside <...>
 local PATTERN_MD_ANGLE = "(!?%[[^%]]*%])%(<(.-)>%)"
 
----
--- Helper to check if a node type is a valid markdown link container
+--- Checks if a Treesitter node type is a valid markdown link container.
+---@param node_type string The type of the node (e.g., "inline_link").
+---@return boolean True if the node is a link container.
 local function is_link_node(node_type)
   return node_type == "inline_link"
     or node_type == "full_reference_link"
@@ -32,9 +23,9 @@ local function is_link_node(node_type)
     or node_type == "image"
 end
 
----
--- Uses Treesitter to extract link target under cursor.
--- Returns nil if TS is unavailable, disabled, or no link is found.
+--- Uses Treesitter to extract the link target under the cursor.
+--- Returns nil if Treesitter is unavailable, disabled, or no link is found.
+---@return string|nil The raw link target text, or nil.
 local function get_ts_link_target()
   if not USE_TREESITTER then
     return nil
@@ -70,14 +61,131 @@ local function get_ts_link_target()
   return nil
 end
 
----
--- A generic function that iterates through all links on a line and applies
--- a transformation based on the provided logic.
--- @param line (string) The line of text to process.
--- @param transform_logic (function) A function that receives a context table for
---   each link found and returns a replacement string, or nil to make no change.
--- @return (string, number) The modified line and the count of replacements.
---
+--- Checks if the cursor is inside a code block or other ignored node (e.g., block quote).
+--- Uses Treesitter to check the host language (Markdown) tree, ignoring injections.
+---@return boolean True if the cursor is in an ignored block.
+local function is_cursor_in_ignored_block()
+  if not USE_TREESITTER or not (vim.treesitter and vim.treesitter.get_node) then
+    return false
+  end
+
+  -- `ignore_injections = true` ensures we check the HOST (Markdown) tree.
+  local node = vim.treesitter.get_node({ ignore_injections = true })
+  while node do
+    local ntype = node:type()
+    if
+      ntype == "code_span"
+      or ntype == "fenced_code_block"
+      or ntype == "code_block"
+      or ntype == "block_quote"
+    then
+      return true
+    end
+    node = node:parent()
+  end
+  return false
+end
+
+--- Scans a line for a link target containing a specific pattern (Hungry Mode).
+---@param line string The text line to search.
+---@param pattern_to_match string The substring pattern to look for.
+---@return string|nil The raw target text if found, or nil.
+local function find_target_by_pattern(line, pattern_to_match)
+  -- 1. Standard/Balanced Markdown links
+  local search_pos = 1
+  while true do
+    local s, e, _, target_parens = line:find(PATTERN_MD_BALANCED, search_pos)
+    if not s then
+      break
+    end
+    search_pos = e + 1
+
+    local target = target_parens:sub(2, -2) -- Strip parens
+    if target and target:find(pattern_to_match, 1, true) then
+      return target
+    end
+  end
+
+  -- 2. Angle Bracket Markdown links
+  search_pos = 1
+  while true do
+    local s, e, _, target = line:find(PATTERN_MD_ANGLE, search_pos)
+    if not s then
+      break
+    end
+    search_pos = e + 1
+    if target and target:find(pattern_to_match, 1, true) then
+      return target
+    end
+  end
+
+  -- 3. Wikilinks
+  search_pos = 1
+  while true do
+    local s, e, target = line:find(PATTERN_WIKI, search_pos)
+    if not s then
+      break
+    end
+    search_pos = e + 1
+    if target and target:find(pattern_to_match, 1, true) then
+      return target
+    end
+  end
+
+  return nil
+end
+
+--- Scans a line for a link target located at a specific column index (Cursor Mode).
+---@param line string The text line to search.
+---@param col number The 1-based column index of the cursor.
+---@return string|nil The raw target text if found, or nil.
+local function find_target_at_cursor(line, col)
+  -- 1. Wikilinks (Prioritize over MD to avoid false matches if nested)
+  local search_pos = 1
+  while true do
+    local s, e, target = line:find(PATTERN_WIKI, search_pos)
+    if not s then
+      break
+    end
+    search_pos = e + 1
+    if col >= s and col <= e then
+      return target
+    end
+  end
+
+  -- 2. Angle Bracket Markdown links (MOVED UP: Check specific syntax before generic balanced)
+  search_pos = 1
+  while true do
+    local s, e, _, target = line:find(PATTERN_MD_ANGLE, search_pos)
+    if not s then
+      break
+    end
+    search_pos = e + 1
+    if col >= s and col <= e then
+      return target
+    end
+  end
+
+  -- 3. Standard/Balanced Markdown links
+  search_pos = 1
+  while true do
+    local s, e, _, target_parens = line:find(PATTERN_MD_BALANCED, search_pos)
+    if not s then
+      break
+    end
+    search_pos = e + 1
+    if col >= s and col <= e then
+      return target_parens:sub(2, -2) -- Strip parens
+    end
+  end
+
+  return nil
+end
+
+--- Generic helper that iterates through all links on a line and applies a transformation.
+---@param line string The line of text to process.
+---@param transform_logic function A callback that receives a context table and returns a replacement string or nil.
+---@return string, number The modified line and the count of replacements.
 local function generic_link_transformer(line, transform_logic)
   local total_replacements = 0
 
@@ -105,6 +213,9 @@ local function generic_link_transformer(line, transform_logic)
   line = line:gsub(PATTERN_MD_BALANCED, function(link_text_part, target_parens)
     -- Strip the surrounding parentheses from %b() capture
     local raw_target = target_parens:sub(2, -2)
+    if raw_target:match("^<.*>$") then
+      return nil
+    end
     return replacer({
       type = "markdown",
       display_text = link_text_part:match("^!?%[(.*)%]$"),
@@ -126,11 +237,9 @@ local function generic_link_transformer(line, transform_logic)
   return line, total_replacements
 end
 
----
--- Finds all valid markdown link targets on a single line of text.
--- @param line (string): The line to search.
--- @return (table): A list of processed link targets found on the line.
---
+--- Finds all valid markdown link targets on a single line of text.
+---@param line string The line to search.
+---@return table<string> A list of processed link targets found on the line.
 local function find_all_link_targets(line)
   local targets = {}
   generic_link_transformer(line, function(ctx)
@@ -138,21 +247,18 @@ local function find_all_link_targets(line)
     if processed then
       table.insert(targets, processed)
     end
-    return nil -- No replacement, just discovery
+    return nil
   end)
   return targets
 end
----
--- Scans the current buffer for markdown links that point to non-existent files.
--- @return (table) A list of objects, where each object represents a line
---   containing at least one broken link. Each object contains `lnum` and `text`.
---   Returns an empty table if no broken links are found.
---
+
+--- Scans the current buffer for markdown links that point to non-existent files.
+---@return table A list of objects {filename, lnum, text} representing broken links.
 M.find_broken_links_in_buffer = function()
   local broken_links_info = {}
   local current_buf_path = vim.api.nvim_buf_get_name(0)
   if not current_buf_path or current_buf_path == "" then
-    return broken_links_info -- Not a file buffer
+    return broken_links_info
   end
 
   local current_dir = vim.fn.fnamemodify(current_buf_path, ":p:h")
@@ -163,14 +269,12 @@ M.find_broken_links_in_buffer = function()
     local link_targets = find_all_link_targets(line)
 
     for _, target in ipairs(link_targets) do
-      -- Ignore external URLs when checking for broken file links.
       if not util.is_web_link(target) then
         local full_target_path = util.join_path(current_dir, target)
         full_target_path = vim.fn.fnamemodify(full_target_path, ":p")
-        -- A link is considered broken if the target file isn't readable.
         if vim.fn.filereadable(full_target_path) == 0 then
           has_broken_link_on_line = true
-          break -- One broken link is enough to mark the entire line.
+          break
         end
       end
     end
@@ -187,188 +291,70 @@ M.find_broken_links_in_buffer = function()
   return broken_links_info
 end
 
----
--- Processes a line to find and extract a link based on cursor position or a search pattern.
--- The function operates in two modes:
--- 1. **Cursor Mode** (default): When `pattern_to_match` is nil, it finds the link
---    (Markdown or Wikilink) that is currently under the editor's cursor.
--- 2. **"Hungry" Mode**: When `pattern_to_match` is a string, it ignores the cursor
---    and returns the *first* link found whose target contains `pattern_to_match`
---    as a substring.
--- @param cursor table A table representing the cursor's position, where `cursor[2]` is the 0-indexed column.
--- @param line string The line of text to be analyzed.
--- @param pattern_to_match string|nil The substring to search for in link targets ("hungry mode"), or nil to use cursor position.
--- @return string|nil The processed link target if a match is found, otherwise nil.
+--- Processes a line to find and extract a link based on cursor position or a search pattern.
+---@param cursor table The cursor position {row, col} (0-indexed).
+---@param line string The text line to search.
+---@param pattern_to_match? string Optional pattern to search for (Hungry Mode).
+---@return string|nil The processed link target path, or nil.
 M.process_link = function(cursor, line, pattern_to_match)
-  -- 1. Hungry Mode (Search by pattern)
-  -- Used for rename/delete operations to find specific targets on a line.
+  local raw_target = nil
+
+  -- MODE 1: Hungry Mode (Search by text pattern)
   if pattern_to_match then
-    -- Standard/Balanced Markdown links
-    local search_pos = 1
-    while true do
-      local s, e, _, target_parens = line:find(PATTERN_MD_BALANCED, search_pos)
-      if not s then
-        break
-      end
-      search_pos = e + 1
-      local target = target_parens:sub(2, -2)
-      if target and target:find(pattern_to_match, 1, true) then
-        return util.process_link_target(target, state.markdown_extension)
-      end
-    end
-
-    -- Angle Bracket Markdown links
-    search_pos = 1
-    while true do
-      local s, e, _, target = line:find(PATTERN_MD_ANGLE, search_pos)
-      if not s then
-        break
-      end
-      search_pos = e + 1
-      if target and target:find(pattern_to_match, 1, true) then
-        return util.process_link_target(target, state.markdown_extension)
-      end
-    end
-
-    -- Wikilinks
-    search_pos = 1
-    while true do
-      local s, e, target = line:find(PATTERN_WIKI, search_pos)
-      if not s then
-        break
-      end
-      search_pos = e + 1
-      if target and target:find(pattern_to_match, 1, true) then
-        return util.process_link_target(target, state.markdown_extension)
-      end
-    end
-    return nil
-  end
-
-  -- 2. Cursor Mode
-
-  -- A. Try Treesitter (Best for context awareness)
-  local ts_target = get_ts_link_target()
-  if ts_target then
-    return util.process_link_target(ts_target, state.markdown_extension)
-  end
-
-  -- B. Treesitter Safety Check (Block Detection)
-  -- Uses `ignore_injections = true` to check the HOST (Markdown) tree.
-  -- This ensures we detect code blocks even if the language inside is injected (e.g., Python).
-  if USE_TREESITTER and vim.treesitter and vim.treesitter.get_node then
-    local node = vim.treesitter.get_node({ ignore_injections = true })
-    while node do
-      local ntype = node:type()
-      if
-        ntype == "code_span"
-        or ntype == "fenced_code_block"
-        or ntype == "code_block"
-        or ntype == "block_quote"
-      then
-        return nil -- Cursor is in a "safe" block; do not process regex.
-      end
-      node = node:parent()
-    end
-  end
-
-  local col = cursor[2] + 1
-
-  -- C. Regex Fallback
-  -- (Prioritize Wikilinks since standard links are likely handled by TS)
-
-  -- Wikilinks
-  do
-    local search_pos = 1
-    while true do
-      local s, e, target = line:find(PATTERN_WIKI, search_pos)
-      if not s then
-        break
-      end
-      search_pos = e + 1
-      if col >= s and col <= e then
-        return util.process_link_target(target, state.markdown_extension)
+    raw_target = find_target_by_pattern(line, pattern_to_match)
+  else
+    -- MODE 2: Cursor Mode (Search under cursor)
+    -- A. Try Treesitter extraction first (Best context awareness)
+    raw_target = get_ts_link_target()
+    -- B. If no TS match, try Regex fallback (with Safety Checks)
+    if not raw_target then
+      if not is_cursor_in_ignored_block() then
+        raw_target = find_target_at_cursor(line, cursor[2] + 1)
       end
     end
   end
 
-  -- Standard/Balanced Markdown links
-  do
-    local search_pos = 1
-    while true do
-      local s, e, _, target_parens = line:find(PATTERN_MD_BALANCED, search_pos)
-      if not s then
-        break
-      end
-      search_pos = e + 1
-      if col >= s and col <= e then
-        local target = target_parens:sub(2, -2)
-        return util.process_link_target(target, state.markdown_extension)
-      end
-    end
-  end
-
-  -- Angle Bracket Markdown links
-  do
-    local search_pos = 1
-    while true do
-      local s, e, _, target = line:find(PATTERN_MD_ANGLE, search_pos)
-      if not s then
-        break
-      end
-      search_pos = e + 1
-      if col >= s and col <= e then
-        return util.process_link_target(target, state.markdown_extension)
-      end
-    end
+  if raw_target then
+    return util.process_link_target(raw_target, state.markdown_extension)
   end
 
   return nil
 end
 
----
--- Finds and transforms all links on a line that match a specific filename pattern.
--- @param line (string) The line containing links.
--- @param pattern_to_match (string) The substring to find within a link's target.
--- @param transform_fn (function) A function that returns the new link markup.
--- @return (string, number) The modified line and the total count of replacements made.
---
+--- Finds and transforms all links on a line that match a specific filename pattern.
+---@param line string The line containing links.
+---@param pattern_to_match string The substring to find within a link's target.
+---@param transform_fn function A function that returns the new link markup.
+---@return string, number The modified line and the total count of replacements made.
 M.find_and_transform_link_markup = function(line, pattern_to_match, transform_fn)
   return generic_link_transformer(line, function(contex)
     if contex.raw_target and contex.raw_target:find(pattern_to_match, 1, true) then
-      -- Call the original transform_fn, maintaining its signature for compatibility.
       if contex.type == "markdown" then
         return transform_fn("[" .. contex.display_text .. "]", contex.raw_target)
-      else -- wikilink
+      else
         return transform_fn(contex.display_text)
       end
     end
-    return nil -- No match, so no change.
+    return nil
   end)
 end
 
----
--- Finds and removes the markup for broken local links on a single line, preserving text.
--- This function is used by the cleanup_broken_links action.
--- @param line (string) The line to process.
--- @param current_dir (string) The absolute path of the file's directory.
--- @return (string, boolean) The modified line and a boolean indicating if changes were made.
---
+--- Finds and removes the markup for broken local links on a single line, preserving text.
+---@param line string The line to process.
+---@param current_dir string The absolute path of the file's directory.
+---@return string, boolean The modified line and a boolean indicating if changes were made.
 M.remove_broken_markup = function(line, current_dir)
   local modified_line, count = generic_link_transformer(line, function(context)
     if not util.is_web_link(context.raw_target) then
-      -- To check the file path, we need the fully processed target name.
       local processed_target =
         util.process_link_target(context.raw_target, state.markdown_extension)
       local full_target_path = util.join_path(current_dir, processed_target)
 
-      -- If the file is not readable, it's a broken link.
       if vim.fn.filereadable(full_target_path) == 0 then
-        -- Return just the display text to remove the link markup.
         return context.display_text
       end
     end
-    return nil -- Link is valid or is a web link, so no change.
+    return nil
   end)
   return modified_line, count > 0
 end

@@ -10,13 +10,6 @@ local warn = vim.health.warn
 local error = vim.health.error
 local info = vim.health.info
 
---- Checks if a specific executable is available in the system path.
--- @param tool (string) The name of the executable to check (e.g., "rg").
--- @return (boolean) True if the tool is executable, false otherwise.
-local function check_external_tool(tool)
-  return vim.fn.executable(tool) == 1
-end
-
 ---
 -- Runs the health check for the neowiki plugin.
 -- Validates external tools, dependencies, and configuration paths.
@@ -25,10 +18,16 @@ end
 M.check = function()
   start("neowiki: External Tools")
 
+  local tools = {
+    fd  = { name = "fd", binaries = { "fd", "fdfind" } },
+    git = { name = "git" },
+    rg  = { name = "rg" },
+  }
+
   local tool_status = {
-    rg = check_external_tool("rg"),
-    fd = check_external_tool("fd"),
-    git = check_external_tool("git"),
+    rg = util.check_binary_installed(tools.rg),
+    fd = util.check_binary_installed(tools.fd),
+    git = util.check_binary_installed(tools.git),
   }
 
   if tool_status.rg then
@@ -38,7 +37,7 @@ M.check = function()
   end
 
   if tool_status.fd then
-    ok("fd: Installed")
+    ok("fd (" .. tool_status.fd.binary .. "): Installed")
   else
     warn("fd: Not found")
   end

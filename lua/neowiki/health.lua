@@ -73,7 +73,16 @@ M.check = function()
     local parsers = require("nvim-treesitter.parsers")
     local required_parsers = { "markdown", "markdown_inline" }
     for _, parser in ipairs(required_parsers) do
-      if parsers.has_parser(parser) then
+      -- The nvim-treesitter parser module completely changed in the last major release. Therefore
+      -- we first check for the old `has_parser` function and then check on the module table
+      -- directly as the new release returns a table with the parser.
+      local has_parser
+      if _G["nvim-treesitter.parsers.has_parser"] then
+        has_parser = parsers.has_parser(parser)
+      else
+        has_parser = parsers[parser]
+      end
+      if has_parser then
         ok(string.format(" - Parser '%s': Installed", parser))
       else
         warn(string.format(" - Parser '%s': Missing", parser))

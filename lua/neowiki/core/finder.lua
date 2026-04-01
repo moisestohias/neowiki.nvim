@@ -41,7 +41,7 @@ local find_files = function(search_path, search_term, search_type)
     table.insert(command, search_path)
 
     files = vim.fn.systemlist(command)
-    if vim.v.shell_error == 0 then
+    if vim.v.shell_error == 0 or vim.v.shell_error == 1 then
       -- rg can return relative paths; ensure they are absolute.
       local absolute_files = {}
       for _, file in ipairs(files) do
@@ -200,7 +200,7 @@ M.find_backlinks = function(search_path, target_filename)
   }
 
   local results = vim.fn.systemlist(command)
-  if vim.v.shell_error ~= 0 or not results or vim.tbl_isempty(results) then
+  if vim.v.shell_error ~= 0 and vim.v.shell_error ~= 1 then
     return nil -- rg command failed or returned no results.
   end
 

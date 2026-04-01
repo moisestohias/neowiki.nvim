@@ -8,20 +8,14 @@ local M = {}
 -- Variable to ensure the fallback notification is only shown once per session.
 local native_fallback_notified = false
 
-
 local tools = {
-  fd  = { name = "fd", binaries = { "fd", "fdfind" } },
-  git = { name = "git" },
-  rg  = { name = "rg" },
+  rg = { name = "rg" },
 }
 
 local rg = util.check_binary_installed(tools.rg)
-local fd = util.check_binary_installed(tools.fd)
-local git = util.check_binary_installed(tools.git)
 
 ---
--- Generic file finder that uses fast command-line tools if available.
--- It prioritizes rg > fd > git, falling back to a native vim glob.
+-- Generic file finder that uses fast command-line tool (rg) if available.
 -- All returned paths are made absolute.
 -- @param search_path (string) The absolute path of the directory to search.
 -- @param search_term (string) The filename or extension to find.
@@ -51,53 +45,10 @@ local find_files = function(search_path, search_term, search_type)
       return absolute_files
     end
   end
-
-  if fd then
-    if search_type == "ext" then
-      -- fd expects the extension without the dot.
-      command = { fd.binary, "--type=f", "--no-follow", "-e", search_term:sub(2), ".", search_path }
-    else -- 'name'
-      command = { fd.binary, "--type=f", "--no-follow", "--glob", search_term, ".", search_path }
-    end
-    files = vim.fn.systemlist(command)
-    if vim.v.shell_error == 0 then
-      -- fd with a base directory returns absolute paths.
-      -- vim.notify("fd is used")
-      return files
-    end
-  end
-
-  if git and vim.fn.isdirectory(util.join_path(search_path, ".git")) then
-    command = { git.binary, "-C", search_path, "ls-files", "--cached", "--others", "--exclude-standard" }
-    local all_files = vim.fn.systemlist(command)
-    if vim.v.shell_error == 0 then
-      local results = {}
-      for _, file in ipairs(all_files) do
-        local should_add = false
-        if search_type == "ext" then
-          if file:match(vim.pesc(search_term) .. "$") then
-            should_add = true
-          end
-        else -- 'name'
-          if vim.fn.fnamemodify(file, ":t") == search_term then
-            should_add = true
-          end
-        end
-
-        if should_add then
-          -- git ls-files returns paths relative to `search_path`, so join them to make them absolute.
-          table.insert(results, util.join_path(search_path, file))
-        end
-      end
-      -- vim.notify("git is used")
-      return results
-    end
-  end
-
-  -- 4. Fallback to native globpath if all CLI tools failed.
+  -- Fallback to native globpath if all CLI tools failed.
   if not native_fallback_notified then
     vim.notify(
-      "rg, fd, and git not available or failed. Falling back to slower native search.",
+      "rg is not available or failed. Falling back to slower native search.",
       vim.log.levels.INFO,
       { title = "neowiki" }
     )

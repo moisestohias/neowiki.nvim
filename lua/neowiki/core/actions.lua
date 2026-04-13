@@ -132,7 +132,69 @@ M.gen_link_from_selection = function()
 end
 
 ---
+-- Finds a file by name within the wiki, searching from the wiki root.
+-- Uses ripgrep if available, otherwise falls back to native glob.
+-- @param wiki_root (string): The wiki root directory to search from.
+-- @param filename (string): The filename to search for (e.g., "Note.md").
+-- @return (string|nil): The absolute path to the file if found, nil otherwise.
+--
+local function find_file_in_wiki(wiki_root, filename)
+  if not wiki_root or wiki_root == "" then
+    return nil
+  end
+
+  -- Extract the basename without extension for flexible matching
+  local basename = vim.fn.fnamemodify(filename, ":t:r")
+  local ext = vim.fn.fnamemodify(filename, ":e")
+  if ext and ext ~= "" then
+    ext = "." .. ext
+  else
+    ext = config.markdown_extension or ".md"
+  end
+
+  -- Try ripgrep first for fast searching
+  local tools = { rg = { name = "rg" } }
+  local rg = util.check_binary_installed(tools.rg)
+
+  if rg then
+    -- Search for files matching the pattern
+    local search_pattern = "**/*" .. basename .. "*" .. ext
+    local command = {
+      rg.binary,
+      "--files",
+      "--iglob",
+      search_pattern,
+      wiki_root,
+    }
+    local files = vim.fn.systemlist(command)
+    if vim.v.shell_error == 0 or vim.v.shell_error == 1 then
+      for _, file in ipairs(files) do
+        local abs_path = vim.fn.fnamemodify(file, ":p")
+        -- Check if the file exists and matches the expected name
+        local file_basename = vim.fn.fnamemodify(abs_path, ":t:r")
+        if file_basename:lower() == basename:lower() then
+          return abs_path
+        end
+      end
+    end
+  end
+
+  -- Fallback: try direct glob from wiki root
+  local glob_pattern = "**/*" .. basename .. "*" .. ext
+  local matches = vim.fn.globpath(wiki_root, glob_pattern, false, true)
+  for _, match in ipairs(matches) do
+    local file_basename = vim.fn.fnamemodify(match, ":t:r")
+    if file_basename:lower() == basename:lower() then
+      return match
+    end
+  end
+
+  return nil
+end
+
+---
 -- Finds a markdown link under the cursor and opens the target file.
+-- Searches vault-root when file is not found relative to current file.
 -- @param open_cmd (string|nil): Optional command for opening the file (e.g., 'vsplit').
 --
 M.follow_link = function(open_cmd)
@@ -153,7 +215,25 @@ M.follow_link = function(open_cmd)
       return
     end
 
+    -- Try relative to current file first
     local full_path = util.join_path(active_path, filename)
+
+    -- If not found relative to current file, search from wiki root
+    if vim.fn.filereadable(full_path) == 0 then
+      local wiki_root = vim.b[0].wiki_root or vim.b[0].ultimate_wiki_root
+      if wiki_root then
+        -- Strip the leading "./" from filename for wiki search
+        local search_filename = filename:gsub("^%./", "")
+        local found_path = find_file_in_wiki(wiki_root, search_filename)
+        if found_path then
+          full_path = found_path
+        else
+          -- Fallback: create in wiki root if it's a new note
+          full_path = util.join_path(wiki_root, search_filename)
+        end
+      end
+    end
+
     add_to_history(full_path)
 
     -- reuse the current floating window to open the new link.
